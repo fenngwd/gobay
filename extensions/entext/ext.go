@@ -3,6 +3,8 @@ package entext
 import (
 	"database/sql"
 	"errors"
+	"math/rand"
+	"time"
 
 	"github.com/facebook/ent/dialect"
 	entsql "github.com/facebook/ent/dialect/sql"
@@ -61,7 +63,9 @@ func (d *EntExt) Init(app *gobay.Application) error {
 	db.SetMaxOpenConns(config.GetInt("max_open_conns"))
 	db.SetMaxIdleConns(config.GetInt("max_idle_conns"))
 	if config.IsSet("conn_max_lifetime") {
-		db.SetConnMaxLifetime(config.GetDuration("conn_max_lifetime"))
+		// 增加随机延时，避免部署时多个 Pod 连接到期时间接近，导致数据库新建连接飙升
+		rand.Seed(int64(time.Now().Second()))
+		db.SetConnMaxLifetime(config.GetDuration("conn_max_lifetime") + time.Duration(rand.Intn(30)) * time.Second)
 	}
 	drv := entsql.OpenDB(dbDriver, db)
 	d.drv = drv
