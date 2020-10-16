@@ -148,11 +148,18 @@ func (c *CacheExt) GetMany(ctx context.Context, out map[string]interface{}) erro
 	}
 	for i, value := range c.backend.GetMany(ctx, transedKeys) {
 		key := transedKey2key[transedKeys[i]]
+		//缓存命中
 		if value != nil {
-			if err := decode(value, out[key]); err != nil {
-				return err
+			// 缓存了一个 Nil 值
+			if decodeIsNil(value) {
+				out[key] = nil
+			} else {
+				if err := decode(value, out[key]); err != nil {
+					return err
+				}
 			}
 		} else {
+			// 缓存未命中
 			out[key] = nil
 		}
 	}
