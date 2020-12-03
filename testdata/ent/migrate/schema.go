@@ -3,8 +3,6 @@
 package migrate
 
 import (
-	"github.com/shanbay/gobay/testdata/ent/user"
-
 	"github.com/facebook/ent/dialect/sql/schema"
 	"github.com/facebook/ent/schema/field"
 )
@@ -13,7 +11,7 @@ var (
 	// UsersColumns holds the columns for the "users" table.
 	UsersColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeInt, Increment: true},
-		{Name: "nickname", Type: field.TypeString, Default: user.DefaultNickname},
+		{Name: "nickname", Type: field.TypeString, Default: "jeff"},
 		{Name: "username", Type: field.TypeString, Unique: true},
 	}
 	// UsersTable holds the schema information for the "users" table.

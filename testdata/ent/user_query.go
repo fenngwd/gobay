@@ -9,6 +9,8 @@ import (
 	"math"
 
 	"github.com/facebook/ent/dialect/sql"
+	"github.com/facebook/ent/dialect/sql/sqlgraph"
+	"github.com/facebook/ent/schema/field"
 	"github.com/shanbay/gobay/testdata/ent/predicate"
 	"github.com/shanbay/gobay/testdata/ent/user"
 )
@@ -18,11 +20,12 @@ type UserQuery struct {
 	config
 	limit      *int
 	offset     *int
-	order      []Order
+	order      []OrderFunc
 	unique     []string
 	predicates []predicate.User
-	// intermediate query.
-	sql *sql.Selector
+	// intermediate query (i.e. traversal path).
+	sql  *sql.Selector
+	path func(context.Context) (*sql.Selector, error)
 }
 
 // Where adds a new predicate for the builder.
@@ -44,19 +47,19 @@ func (uq *UserQuery) Offset(offset int) *UserQuery {
 }
 
 // Order adds an order step to the query.
-func (uq *UserQuery) Order(o ...Order) *UserQuery {
+func (uq *UserQuery) Order(o ...OrderFunc) *UserQuery {
 	uq.order = append(uq.order, o...)
 	return uq
 }
 
-// First returns the first User entity in the query. Returns *ErrNotFound when no user was found.
+// First returns the first User entity in the query. Returns *NotFoundError when no user was found.
 func (uq *UserQuery) First(ctx context.Context) (*User, error) {
 	us, err := uq.Limit(1).All(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if len(us) == 0 {
-		return nil, &ErrNotFound{user.Label}
+		return nil, &NotFoundError{user.Label}
 	}
 	return us[0], nil
 }
@@ -70,14 +73,14 @@ func (uq *UserQuery) FirstX(ctx context.Context) *User {
 	return u
 }
 
-// FirstID returns the first User id in the query. Returns *ErrNotFound when no id was found.
+// FirstID returns the first User id in the query. Returns *NotFoundError when no id was found.
 func (uq *UserQuery) FirstID(ctx context.Context) (id int, err error) {
 	var ids []int
 	if ids, err = uq.Limit(1).IDs(ctx); err != nil {
 		return
 	}
 	if len(ids) == 0 {
-		err = &ErrNotFound{user.Label}
+		err = &NotFoundError{user.Label}
 		return
 	}
 	return ids[0], nil
@@ -102,9 +105,9 @@ func (uq *UserQuery) Only(ctx context.Context) (*User, error) {
 	case 1:
 		return us[0], nil
 	case 0:
-		return nil, &ErrNotFound{user.Label}
+		return nil, &NotFoundError{user.Label}
 	default:
-		return nil, &ErrNotSingular{user.Label}
+		return nil, &NotSingularError{user.Label}
 	}
 }
 
@@ -127,15 +130,15 @@ func (uq *UserQuery) OnlyID(ctx context.Context) (id int, err error) {
 	case 1:
 		id = ids[0]
 	case 0:
-		err = &ErrNotFound{user.Label}
+		err = &NotFoundError{user.Label}
 	default:
-		err = &ErrNotSingular{user.Label}
+		err = &NotSingularError{user.Label}
 	}
 	return
 }
 
-// OnlyXID is like OnlyID, but panics if an error occurs.
-func (uq *UserQuery) OnlyXID(ctx context.Context) int {
+// OnlyIDX is like OnlyID, but panics if an error occurs.
+func (uq *UserQuery) OnlyIDX(ctx context.Context) int {
 	id, err := uq.OnlyID(ctx)
 	if err != nil {
 		panic(err)
@@ -145,6 +148,9 @@ func (uq *UserQuery) OnlyXID(ctx context.Context) int {
 
 // All executes the query and returns a list of Users.
 func (uq *UserQuery) All(ctx context.Context) ([]*User, error) {
+	if err := uq.prepareQuery(ctx); err != nil {
+		return nil, err
+	}
 	return uq.sqlAll(ctx)
 }
 
@@ -177,6 +183,9 @@ func (uq *UserQuery) IDsX(ctx context.Context) []int {
 
 // Count returns the count of the given query.
 func (uq *UserQuery) Count(ctx context.Context) (int, error) {
+	if err := uq.prepareQuery(ctx); err != nil {
+		return 0, err
+	}
 	return uq.sqlCount(ctx)
 }
 
@@ -191,6 +200,9 @@ func (uq *UserQuery) CountX(ctx context.Context) int {
 
 // Exist returns true if the query has elements in the graph.
 func (uq *UserQuery) Exist(ctx context.Context) (bool, error) {
+	if err := uq.prepareQuery(ctx); err != nil {
+		return false, err
+	}
 	return uq.sqlExist(ctx)
 }
 
@@ -210,11 +222,12 @@ func (uq *UserQuery) Clone() *UserQuery {
 		config:     uq.config,
 		limit:      uq.limit,
 		offset:     uq.offset,
-		order:      append([]Order{}, uq.order...),
+		order:      append([]OrderFunc{}, uq.order...),
 		unique:     append([]string{}, uq.unique...),
 		predicates: append([]predicate.User{}, uq.predicates...),
 		// clone intermediate query.
-		sql: uq.sql.Clone(),
+		sql:  uq.sql.Clone(),
+		path: uq.path,
 	}
 }
 
@@ -236,7 +249,12 @@ func (uq *UserQuery) Clone() *UserQuery {
 func (uq *UserQuery) GroupBy(field string, fields ...string) *UserGroupBy {
 	group := &UserGroupBy{config: uq.config}
 	group.fields = append([]string{field}, fields...)
-	group.sql = uq.sqlQuery()
+	group.path = func(ctx context.Context) (prev *sql.Selector, err error) {
+		if err := uq.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		return uq.sqlQuery(), nil
+	}
 	return group
 }
 
@@ -255,50 +273,56 @@ func (uq *UserQuery) GroupBy(field string, fields ...string) *UserGroupBy {
 func (uq *UserQuery) Select(field string, fields ...string) *UserSelect {
 	selector := &UserSelect{config: uq.config}
 	selector.fields = append([]string{field}, fields...)
-	selector.sql = uq.sqlQuery()
+	selector.path = func(ctx context.Context) (prev *sql.Selector, err error) {
+		if err := uq.prepareQuery(ctx); err != nil {
+			return nil, err
+		}
+		return uq.sqlQuery(), nil
+	}
 	return selector
 }
 
+func (uq *UserQuery) prepareQuery(ctx context.Context) error {
+	if uq.path != nil {
+		prev, err := uq.path(ctx)
+		if err != nil {
+			return err
+		}
+		uq.sql = prev
+	}
+	return nil
+}
+
 func (uq *UserQuery) sqlAll(ctx context.Context) ([]*User, error) {
-	rows := &sql.Rows{}
-	selector := uq.sqlQuery()
-	if unique := uq.unique; len(unique) == 0 {
-		selector.Distinct()
+	var (
+		nodes = []*User{}
+		_spec = uq.querySpec()
+	)
+	_spec.ScanValues = func() []interface{} {
+		node := &User{config: uq.config}
+		nodes = append(nodes, node)
+		values := node.scanValues()
+		return values
 	}
-	query, args := selector.Query()
-	if err := uq.driver.Query(ctx, query, args, rows); err != nil {
+	_spec.Assign = func(values ...interface{}) error {
+		if len(nodes) == 0 {
+			return fmt.Errorf("ent: Assign called without calling ScanValues")
+		}
+		node := nodes[len(nodes)-1]
+		return node.assignValues(values...)
+	}
+	if err := sqlgraph.QueryNodes(ctx, uq.driver, _spec); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var us Users
-	if err := us.FromRows(rows); err != nil {
-		return nil, err
+	if len(nodes) == 0 {
+		return nodes, nil
 	}
-	us.config(uq.config)
-	return us, nil
+	return nodes, nil
 }
 
 func (uq *UserQuery) sqlCount(ctx context.Context) (int, error) {
-	rows := &sql.Rows{}
-	selector := uq.sqlQuery()
-	unique := []string{user.FieldID}
-	if len(uq.unique) > 0 {
-		unique = uq.unique
-	}
-	selector.Count(sql.Distinct(selector.Columns(unique...)...))
-	query, args := selector.Query()
-	if err := uq.driver.Query(ctx, query, args, rows); err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		return 0, errors.New("ent: no rows found")
-	}
-	var n int
-	if err := rows.Scan(&n); err != nil {
-		return 0, fmt.Errorf("ent: failed reading count: %v", err)
-	}
-	return n, nil
+	_spec := uq.querySpec()
+	return sqlgraph.CountNodes(ctx, uq.driver, _spec)
 }
 
 func (uq *UserQuery) sqlExist(ctx context.Context) (bool, error) {
@@ -307,6 +331,42 @@ func (uq *UserQuery) sqlExist(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("ent: check existence: %v", err)
 	}
 	return n > 0, nil
+}
+
+func (uq *UserQuery) querySpec() *sqlgraph.QuerySpec {
+	_spec := &sqlgraph.QuerySpec{
+		Node: &sqlgraph.NodeSpec{
+			Table:   user.Table,
+			Columns: user.Columns,
+			ID: &sqlgraph.FieldSpec{
+				Type:   field.TypeInt,
+				Column: user.FieldID,
+			},
+		},
+		From:   uq.sql,
+		Unique: true,
+	}
+	if ps := uq.predicates; len(ps) > 0 {
+		_spec.Predicate = func(selector *sql.Selector) {
+			for i := range ps {
+				ps[i](selector)
+			}
+		}
+	}
+	if limit := uq.limit; limit != nil {
+		_spec.Limit = *limit
+	}
+	if offset := uq.offset; offset != nil {
+		_spec.Offset = *offset
+	}
+	if ps := uq.order; len(ps) > 0 {
+		_spec.Order = func(selector *sql.Selector) {
+			for i := range ps {
+				ps[i](selector)
+			}
+		}
+	}
+	return _spec
 }
 
 func (uq *UserQuery) sqlQuery() *sql.Selector {
@@ -338,19 +398,25 @@ func (uq *UserQuery) sqlQuery() *sql.Selector {
 type UserGroupBy struct {
 	config
 	fields []string
-	fns    []Aggregate
-	// intermediate query.
-	sql *sql.Selector
+	fns    []AggregateFunc
+	// intermediate query (i.e. traversal path).
+	sql  *sql.Selector
+	path func(context.Context) (*sql.Selector, error)
 }
 
 // Aggregate adds the given aggregation functions to the group-by query.
-func (ugb *UserGroupBy) Aggregate(fns ...Aggregate) *UserGroupBy {
+func (ugb *UserGroupBy) Aggregate(fns ...AggregateFunc) *UserGroupBy {
 	ugb.fns = append(ugb.fns, fns...)
 	return ugb
 }
 
 // Scan applies the group-by query and scan the result into the given value.
 func (ugb *UserGroupBy) Scan(ctx context.Context, v interface{}) error {
+	query, err := ugb.path(ctx)
+	if err != nil {
+		return err
+	}
+	ugb.sql = query
 	return ugb.sqlScan(ctx, v)
 }
 
@@ -382,6 +448,32 @@ func (ugb *UserGroupBy) StringsX(ctx context.Context) []string {
 	return v
 }
 
+// String returns a single string from group-by. It is only allowed when querying group-by with one field.
+func (ugb *UserGroupBy) String(ctx context.Context) (_ string, err error) {
+	var v []string
+	if v, err = ugb.Strings(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserGroupBy.Strings returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// StringX is like String, but panics if an error occurs.
+func (ugb *UserGroupBy) StringX(ctx context.Context) string {
+	v, err := ugb.String(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 // Ints returns list of ints from group-by. It is only allowed when querying group-by with one field.
 func (ugb *UserGroupBy) Ints(ctx context.Context) ([]int, error) {
 	if len(ugb.fields) > 1 {
@@ -397,6 +489,32 @@ func (ugb *UserGroupBy) Ints(ctx context.Context) ([]int, error) {
 // IntsX is like Ints, but panics if an error occurs.
 func (ugb *UserGroupBy) IntsX(ctx context.Context) []int {
 	v, err := ugb.Ints(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// Int returns a single int from group-by. It is only allowed when querying group-by with one field.
+func (ugb *UserGroupBy) Int(ctx context.Context) (_ int, err error) {
+	var v []int
+	if v, err = ugb.Ints(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserGroupBy.Ints returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// IntX is like Int, but panics if an error occurs.
+func (ugb *UserGroupBy) IntX(ctx context.Context) int {
+	v, err := ugb.Int(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -424,6 +542,32 @@ func (ugb *UserGroupBy) Float64sX(ctx context.Context) []float64 {
 	return v
 }
 
+// Float64 returns a single float64 from group-by. It is only allowed when querying group-by with one field.
+func (ugb *UserGroupBy) Float64(ctx context.Context) (_ float64, err error) {
+	var v []float64
+	if v, err = ugb.Float64s(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserGroupBy.Float64s returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// Float64X is like Float64, but panics if an error occurs.
+func (ugb *UserGroupBy) Float64X(ctx context.Context) float64 {
+	v, err := ugb.Float64(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 // Bools returns list of bools from group-by. It is only allowed when querying group-by with one field.
 func (ugb *UserGroupBy) Bools(ctx context.Context) ([]bool, error) {
 	if len(ugb.fields) > 1 {
@@ -439,6 +583,32 @@ func (ugb *UserGroupBy) Bools(ctx context.Context) ([]bool, error) {
 // BoolsX is like Bools, but panics if an error occurs.
 func (ugb *UserGroupBy) BoolsX(ctx context.Context) []bool {
 	v, err := ugb.Bools(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// Bool returns a single bool from group-by. It is only allowed when querying group-by with one field.
+func (ugb *UserGroupBy) Bool(ctx context.Context) (_ bool, err error) {
+	var v []bool
+	if v, err = ugb.Bools(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserGroupBy.Bools returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// BoolX is like Bool, but panics if an error occurs.
+func (ugb *UserGroupBy) BoolX(ctx context.Context) bool {
+	v, err := ugb.Bool(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -469,13 +639,29 @@ func (ugb *UserGroupBy) sqlQuery() *sql.Selector {
 type UserSelect struct {
 	config
 	fields []string
-	// intermediate queries.
-	sql *sql.Selector
+	// intermediate query (i.e. traversal path).
+	sql  *sql.Selector
+	path func(context.Context) (*sql.Selector, error)
+
+	distinct bool
 }
 
 // Scan applies the selector query and scan the result into the given value.
 func (us *UserSelect) Scan(ctx context.Context, v interface{}) error {
+	query, err := us.path(ctx)
+	if err != nil {
+		return err
+	}
+	us.sql = query
+	if us.distinct {
+		us.sql.Distinct()
+	}
 	return us.sqlScan(ctx, v)
+}
+
+func (us *UserSelect) Distinct() *UserSelect {
+	us.distinct = true
+	return us
 }
 
 // ScanX is like Scan, but panics if an error occurs.
@@ -506,6 +692,32 @@ func (us *UserSelect) StringsX(ctx context.Context) []string {
 	return v
 }
 
+// String returns a single string from selector. It is only allowed when selecting one field.
+func (us *UserSelect) String(ctx context.Context) (_ string, err error) {
+	var v []string
+	if v, err = us.Strings(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserSelect.Strings returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// StringX is like String, but panics if an error occurs.
+func (us *UserSelect) StringX(ctx context.Context) string {
+	v, err := us.String(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 // Ints returns list of ints from selector. It is only allowed when selecting one field.
 func (us *UserSelect) Ints(ctx context.Context) ([]int, error) {
 	if len(us.fields) > 1 {
@@ -521,6 +733,32 @@ func (us *UserSelect) Ints(ctx context.Context) ([]int, error) {
 // IntsX is like Ints, but panics if an error occurs.
 func (us *UserSelect) IntsX(ctx context.Context) []int {
 	v, err := us.Ints(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// Int returns a single int from selector. It is only allowed when selecting one field.
+func (us *UserSelect) Int(ctx context.Context) (_ int, err error) {
+	var v []int
+	if v, err = us.Ints(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserSelect.Ints returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// IntX is like Int, but panics if an error occurs.
+func (us *UserSelect) IntX(ctx context.Context) int {
+	v, err := us.Int(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -548,6 +786,32 @@ func (us *UserSelect) Float64sX(ctx context.Context) []float64 {
 	return v
 }
 
+// Float64 returns a single float64 from selector. It is only allowed when selecting one field.
+func (us *UserSelect) Float64(ctx context.Context) (_ float64, err error) {
+	var v []float64
+	if v, err = us.Float64s(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserSelect.Float64s returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// Float64X is like Float64, but panics if an error occurs.
+func (us *UserSelect) Float64X(ctx context.Context) float64 {
+	v, err := us.Float64(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 // Bools returns list of bools from selector. It is only allowed when selecting one field.
 func (us *UserSelect) Bools(ctx context.Context) ([]bool, error) {
 	if len(us.fields) > 1 {
@@ -569,6 +833,32 @@ func (us *UserSelect) BoolsX(ctx context.Context) []bool {
 	return v
 }
 
+// Bool returns a single bool from selector. It is only allowed when selecting one field.
+func (us *UserSelect) Bool(ctx context.Context) (_ bool, err error) {
+	var v []bool
+	if v, err = us.Bools(ctx); err != nil {
+		return
+	}
+	switch len(v) {
+	case 1:
+		return v[0], nil
+	case 0:
+		err = &NotFoundError{user.Label}
+	default:
+		err = fmt.Errorf("ent: UserSelect.Bools returned %d results when one was expected", len(v))
+	}
+	return
+}
+
+// BoolX is like Bool, but panics if an error occurs.
+func (us *UserSelect) BoolX(ctx context.Context) bool {
+	v, err := us.Bool(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 func (us *UserSelect) sqlScan(ctx context.Context, v interface{}) error {
 	rows := &sql.Rows{}
 	query, args := us.sqlQuery().Query()
@@ -580,7 +870,7 @@ func (us *UserSelect) sqlScan(ctx context.Context, v interface{}) error {
 }
 
 func (us *UserSelect) sqlQuery() sql.Querier {
-	view := "user_view"
-	return sql.Dialect(us.driver.Dialect()).
-		Select(us.fields...).From(us.sql.As(view))
+	selector := us.sql
+	selector.Select(selector.Columns(us.fields...)...)
+	return selector
 }

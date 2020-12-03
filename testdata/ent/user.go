@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/facebook/ent/dialect/sql"
+	"github.com/shanbay/gobay/testdata/ent/user"
 )
 
 // User is the model entity for the User schema.
@@ -20,24 +21,37 @@ type User struct {
 	Username string `json:"username,omitempty"`
 }
 
-// FromRows scans the sql response data into User.
-func (u *User) FromRows(rows *sql.Rows) error {
-	var scanu struct {
-		ID       int
-		Nickname sql.NullString
-		Username sql.NullString
+// scanValues returns the types for scanning values from sql.Rows.
+func (*User) scanValues() []interface{} {
+	return []interface{}{
+		&sql.NullInt64{},  // id
+		&sql.NullString{}, // nickname
+		&sql.NullString{}, // username
 	}
-	// the order here should be the same as in the `user.Columns`.
-	if err := rows.Scan(
-		&scanu.ID,
-		&scanu.Nickname,
-		&scanu.Username,
-	); err != nil {
-		return err
+}
+
+// assignValues assigns the values that were returned from sql.Rows (after scanning)
+// to the User fields.
+func (u *User) assignValues(values ...interface{}) error {
+	if m, n := len(values), len(user.Columns); m < n {
+		return fmt.Errorf("mismatch number of scan values: %d != %d", m, n)
 	}
-	u.ID = scanu.ID
-	u.Nickname = scanu.Nickname.String
-	u.Username = scanu.Username.String
+	value, ok := values[0].(*sql.NullInt64)
+	if !ok {
+		return fmt.Errorf("unexpected type %T for field id", value)
+	}
+	u.ID = int(value.Int64)
+	values = values[1:]
+	if value, ok := values[0].(*sql.NullString); !ok {
+		return fmt.Errorf("unexpected type %T for field nickname", values[0])
+	} else if value.Valid {
+		u.Nickname = value.String
+	}
+	if value, ok := values[1].(*sql.NullString); !ok {
+		return fmt.Errorf("unexpected type %T for field username", values[1])
+	} else if value.Valid {
+		u.Username = value.String
+	}
 	return nil
 }
 
@@ -45,7 +59,7 @@ func (u *User) FromRows(rows *sql.Rows) error {
 // Note that, you need to call User.Unwrap() before calling this method, if this User
 // was returned from a transaction, and the transaction was committed or rolled back.
 func (u *User) Update() *UserUpdateOne {
-	return (&UserClient{u.config}).UpdateOne(u)
+	return (&UserClient{config: u.config}).UpdateOne(u)
 }
 
 // Unwrap unwraps the entity that was returned from a transaction after it was closed,
@@ -74,18 +88,6 @@ func (u *User) String() string {
 
 // Users is a parsable slice of User.
 type Users []*User
-
-// FromRows scans the sql response data into Users.
-func (u *Users) FromRows(rows *sql.Rows) error {
-	for rows.Next() {
-		scanu := &User{}
-		if err := scanu.FromRows(rows); err != nil {
-			return err
-		}
-		*u = append(*u, scanu)
-	}
-	return nil
-}
 
 func (u Users) config(cfg config) {
 	for _i := range u {

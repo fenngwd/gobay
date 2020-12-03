@@ -4,8 +4,11 @@ package ent
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/facebook/ent/dialect/sql"
+	"github.com/facebook/ent/dialect/sql/sqlgraph"
+	"github.com/facebook/ent/schema/field"
 	"github.com/shanbay/gobay/testdata/ent/predicate"
 	"github.com/shanbay/gobay/testdata/ent/user"
 )
@@ -13,6 +16,8 @@ import (
 // UserDelete is the builder for deleting a User entity.
 type UserDelete struct {
 	config
+	hooks      []Hook
+	mutation   *UserMutation
 	predicates []predicate.User
 }
 
@@ -24,7 +29,31 @@ func (ud *UserDelete) Where(ps ...predicate.User) *UserDelete {
 
 // Exec executes the deletion query and returns how many vertices were deleted.
 func (ud *UserDelete) Exec(ctx context.Context) (int, error) {
-	return ud.sqlExec(ctx)
+	var (
+		err      error
+		affected int
+	)
+	if len(ud.hooks) == 0 {
+		affected, err = ud.sqlExec(ctx)
+	} else {
+		var mut Mutator = MutateFunc(func(ctx context.Context, m Mutation) (Value, error) {
+			mutation, ok := m.(*UserMutation)
+			if !ok {
+				return nil, fmt.Errorf("unexpected mutation type %T", m)
+			}
+			ud.mutation = mutation
+			affected, err = ud.sqlExec(ctx)
+			mutation.done = true
+			return affected, err
+		})
+		for i := len(ud.hooks) - 1; i >= 0; i-- {
+			mut = ud.hooks[i](mut)
+		}
+		if _, err := mut.Mutate(ctx, ud.mutation); err != nil {
+			return 0, err
+		}
+	}
+	return affected, err
 }
 
 // ExecX is like Exec, but panics if an error occurs.
@@ -37,23 +66,23 @@ func (ud *UserDelete) ExecX(ctx context.Context) int {
 }
 
 func (ud *UserDelete) sqlExec(ctx context.Context) (int, error) {
-	var (
-		res     sql.Result
-		builder = sql.Dialect(ud.driver.Dialect())
-	)
-	selector := builder.Select().From(sql.Table(user.Table))
-	for _, p := range ud.predicates {
-		p(selector)
+	_spec := &sqlgraph.DeleteSpec{
+		Node: &sqlgraph.NodeSpec{
+			Table: user.Table,
+			ID: &sqlgraph.FieldSpec{
+				Type:   field.TypeInt,
+				Column: user.FieldID,
+			},
+		},
 	}
-	query, args := builder.Delete(user.Table).FromSelect(selector).Query()
-	if err := ud.driver.Exec(ctx, query, args, &res); err != nil {
-		return 0, err
+	if ps := ud.predicates; len(ps) > 0 {
+		_spec.Predicate = func(selector *sql.Selector) {
+			for i := range ps {
+				ps[i](selector)
+			}
+		}
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return int(affected), nil
+	return sqlgraph.DeleteNodes(ctx, ud.driver, _spec)
 }
 
 // UserDeleteOne is the builder for deleting a single User entity.
@@ -68,7 +97,7 @@ func (udo *UserDeleteOne) Exec(ctx context.Context) error {
 	case err != nil:
 		return err
 	case n == 0:
-		return &ErrNotFound{user.Label}
+		return &NotFoundError{user.Label}
 	default:
 		return nil
 	}

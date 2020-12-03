@@ -7,6 +7,8 @@ import (
 	"fmt"
 
 	"github.com/facebook/ent/dialect/sql"
+	"github.com/facebook/ent/dialect/sql/sqlgraph"
+	"github.com/facebook/ent/schema/field"
 	"github.com/shanbay/gobay/testdata/ent/predicate"
 	"github.com/shanbay/gobay/testdata/ent/user"
 )
@@ -14,8 +16,8 @@ import (
 // UserUpdate is the builder for updating User entities.
 type UserUpdate struct {
 	config
-	nickname   *string
-	username   *string
+	hooks      []Hook
+	mutation   *UserMutation
 	predicates []predicate.User
 }
 
@@ -27,7 +29,7 @@ func (uu *UserUpdate) Where(ps ...predicate.User) *UserUpdate {
 
 // SetNickname sets the nickname field.
 func (uu *UserUpdate) SetNickname(s string) *UserUpdate {
-	uu.nickname = &s
+	uu.mutation.SetNickname(s)
 	return uu
 }
 
@@ -41,13 +43,42 @@ func (uu *UserUpdate) SetNillableNickname(s *string) *UserUpdate {
 
 // SetUsername sets the username field.
 func (uu *UserUpdate) SetUsername(s string) *UserUpdate {
-	uu.username = &s
+	uu.mutation.SetUsername(s)
 	return uu
+}
+
+// Mutation returns the UserMutation object of the builder.
+func (uu *UserUpdate) Mutation() *UserMutation {
+	return uu.mutation
 }
 
 // Save executes the query and returns the number of rows/vertices matched by this operation.
 func (uu *UserUpdate) Save(ctx context.Context) (int, error) {
-	return uu.sqlSave(ctx)
+	var (
+		err      error
+		affected int
+	)
+	if len(uu.hooks) == 0 {
+		affected, err = uu.sqlSave(ctx)
+	} else {
+		var mut Mutator = MutateFunc(func(ctx context.Context, m Mutation) (Value, error) {
+			mutation, ok := m.(*UserMutation)
+			if !ok {
+				return nil, fmt.Errorf("unexpected mutation type %T", m)
+			}
+			uu.mutation = mutation
+			affected, err = uu.sqlSave(ctx)
+			mutation.done = true
+			return affected, err
+		})
+		for i := len(uu.hooks) - 1; i >= 0; i-- {
+			mut = uu.hooks[i](mut)
+		}
+		if _, err := mut.Mutate(ctx, uu.mutation); err != nil {
+			return 0, err
+		}
+	}
+	return affected, err
 }
 
 // SaveX is like Save, but panics if an error occurs.
@@ -73,70 +104,58 @@ func (uu *UserUpdate) ExecX(ctx context.Context) {
 }
 
 func (uu *UserUpdate) sqlSave(ctx context.Context) (n int, err error) {
-	var (
-		builder  = sql.Dialect(uu.driver.Dialect())
-		selector = builder.Select(user.FieldID).From(builder.Table(user.Table))
-	)
-	for _, p := range uu.predicates {
-		p(selector)
+	_spec := &sqlgraph.UpdateSpec{
+		Node: &sqlgraph.NodeSpec{
+			Table:   user.Table,
+			Columns: user.Columns,
+			ID: &sqlgraph.FieldSpec{
+				Type:   field.TypeInt,
+				Column: user.FieldID,
+			},
+		},
 	}
-	rows := &sql.Rows{}
-	query, args := selector.Query()
-	if err = uu.driver.Query(ctx, query, args, rows); err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-
-	var ids []int
-	for rows.Next() {
-		var id int
-		if err := rows.Scan(&id); err != nil {
-			return 0, fmt.Errorf("ent: failed reading id: %v", err)
-		}
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-
-	tx, err := uu.driver.Tx(ctx)
-	if err != nil {
-		return 0, err
-	}
-	var (
-		res     sql.Result
-		updater = builder.Update(user.Table)
-	)
-	updater = updater.Where(sql.InInts(user.FieldID, ids...))
-	if value := uu.nickname; value != nil {
-		updater.Set(user.FieldNickname, *value)
-	}
-	if value := uu.username; value != nil {
-		updater.Set(user.FieldUsername, *value)
-	}
-	if !updater.Empty() {
-		query, args := updater.Query()
-		if err := tx.Exec(ctx, query, args, &res); err != nil {
-			return 0, rollback(tx, err)
+	if ps := uu.predicates; len(ps) > 0 {
+		_spec.Predicate = func(selector *sql.Selector) {
+			for i := range ps {
+				ps[i](selector)
+			}
 		}
 	}
-	if err = tx.Commit(); err != nil {
+	if value, ok := uu.mutation.Nickname(); ok {
+		_spec.Fields.Set = append(_spec.Fields.Set, &sqlgraph.FieldSpec{
+			Type:   field.TypeString,
+			Value:  value,
+			Column: user.FieldNickname,
+		})
+	}
+	if value, ok := uu.mutation.Username(); ok {
+		_spec.Fields.Set = append(_spec.Fields.Set, &sqlgraph.FieldSpec{
+			Type:   field.TypeString,
+			Value:  value,
+			Column: user.FieldUsername,
+		})
+	}
+	if n, err = sqlgraph.UpdateNodes(ctx, uu.driver, _spec); err != nil {
+		if _, ok := err.(*sqlgraph.NotFoundError); ok {
+			err = &NotFoundError{user.Label}
+		} else if cerr, ok := isSQLConstraintError(err); ok {
+			err = cerr
+		}
 		return 0, err
 	}
-	return len(ids), nil
+	return n, nil
 }
 
 // UserUpdateOne is the builder for updating a single User entity.
 type UserUpdateOne struct {
 	config
-	id       int
-	nickname *string
-	username *string
+	hooks    []Hook
+	mutation *UserMutation
 }
 
 // SetNickname sets the nickname field.
 func (uuo *UserUpdateOne) SetNickname(s string) *UserUpdateOne {
-	uuo.nickname = &s
+	uuo.mutation.SetNickname(s)
 	return uuo
 }
 
@@ -150,13 +169,42 @@ func (uuo *UserUpdateOne) SetNillableNickname(s *string) *UserUpdateOne {
 
 // SetUsername sets the username field.
 func (uuo *UserUpdateOne) SetUsername(s string) *UserUpdateOne {
-	uuo.username = &s
+	uuo.mutation.SetUsername(s)
 	return uuo
+}
+
+// Mutation returns the UserMutation object of the builder.
+func (uuo *UserUpdateOne) Mutation() *UserMutation {
+	return uuo.mutation
 }
 
 // Save executes the query and returns the updated entity.
 func (uuo *UserUpdateOne) Save(ctx context.Context) (*User, error) {
-	return uuo.sqlSave(ctx)
+	var (
+		err  error
+		node *User
+	)
+	if len(uuo.hooks) == 0 {
+		node, err = uuo.sqlSave(ctx)
+	} else {
+		var mut Mutator = MutateFunc(func(ctx context.Context, m Mutation) (Value, error) {
+			mutation, ok := m.(*UserMutation)
+			if !ok {
+				return nil, fmt.Errorf("unexpected mutation type %T", m)
+			}
+			uuo.mutation = mutation
+			node, err = uuo.sqlSave(ctx)
+			mutation.done = true
+			return node, err
+		})
+		for i := len(uuo.hooks) - 1; i >= 0; i-- {
+			mut = uuo.hooks[i](mut)
+		}
+		if _, err := mut.Mutate(ctx, uuo.mutation); err != nil {
+			return nil, err
+		}
+	}
+	return node, err
 }
 
 // SaveX is like Save, but panics if an error occurs.
@@ -182,59 +230,44 @@ func (uuo *UserUpdateOne) ExecX(ctx context.Context) {
 }
 
 func (uuo *UserUpdateOne) sqlSave(ctx context.Context) (u *User, err error) {
-	var (
-		builder  = sql.Dialect(uuo.driver.Dialect())
-		selector = builder.Select(user.Columns...).From(builder.Table(user.Table))
-	)
-	user.ID(uuo.id)(selector)
-	rows := &sql.Rows{}
-	query, args := selector.Query()
-	if err = uuo.driver.Query(ctx, query, args, rows); err != nil {
-		return nil, err
+	_spec := &sqlgraph.UpdateSpec{
+		Node: &sqlgraph.NodeSpec{
+			Table:   user.Table,
+			Columns: user.Columns,
+			ID: &sqlgraph.FieldSpec{
+				Type:   field.TypeInt,
+				Column: user.FieldID,
+			},
+		},
 	}
-	defer rows.Close()
-
-	var ids []int
-	for rows.Next() {
-		var id int
-		u = &User{config: uuo.config}
-		if err := u.FromRows(rows); err != nil {
-			return nil, fmt.Errorf("ent: failed scanning row into User: %v", err)
+	id, ok := uuo.mutation.ID()
+	if !ok {
+		return nil, &ValidationError{Name: "ID", err: fmt.Errorf("missing User.ID for update")}
+	}
+	_spec.Node.ID.Value = id
+	if value, ok := uuo.mutation.Nickname(); ok {
+		_spec.Fields.Set = append(_spec.Fields.Set, &sqlgraph.FieldSpec{
+			Type:   field.TypeString,
+			Value:  value,
+			Column: user.FieldNickname,
+		})
+	}
+	if value, ok := uuo.mutation.Username(); ok {
+		_spec.Fields.Set = append(_spec.Fields.Set, &sqlgraph.FieldSpec{
+			Type:   field.TypeString,
+			Value:  value,
+			Column: user.FieldUsername,
+		})
+	}
+	u = &User{config: uuo.config}
+	_spec.Assign = u.assignValues
+	_spec.ScanValues = u.scanValues()
+	if err = sqlgraph.UpdateNode(ctx, uuo.driver, _spec); err != nil {
+		if _, ok := err.(*sqlgraph.NotFoundError); ok {
+			err = &NotFoundError{user.Label}
+		} else if cerr, ok := isSQLConstraintError(err); ok {
+			err = cerr
 		}
-		id = u.ID
-		ids = append(ids, id)
-	}
-	switch n := len(ids); {
-	case n == 0:
-		return nil, &ErrNotFound{fmt.Sprintf("User with id: %v", uuo.id)}
-	case n > 1:
-		return nil, fmt.Errorf("ent: more than one User with the same id: %v", uuo.id)
-	}
-
-	tx, err := uuo.driver.Tx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var (
-		res     sql.Result
-		updater = builder.Update(user.Table)
-	)
-	updater = updater.Where(sql.InInts(user.FieldID, ids...))
-	if value := uuo.nickname; value != nil {
-		updater.Set(user.FieldNickname, *value)
-		u.Nickname = *value
-	}
-	if value := uuo.username; value != nil {
-		updater.Set(user.FieldUsername, *value)
-		u.Username = *value
-	}
-	if !updater.Empty() {
-		query, args := updater.Query()
-		if err := tx.Exec(ctx, query, args, &res); err != nil {
-			return nil, rollback(tx, err)
-		}
-	}
-	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	return u, nil
